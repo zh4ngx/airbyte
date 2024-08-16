@@ -8,13 +8,12 @@ from dataclasses import InitVar, dataclass
 from typing import Any, Iterable, Mapping, Optional, Union
 
 import requests
-from airbyte_cdk.models import SyncMode
 from airbyte_cdk.sources.declarative.auth.declarative_authenticator import DeclarativeAuthenticator
 from airbyte_cdk.sources.declarative.auth.token import BasicHttpAuthenticator
+from airbyte_cdk.sources.declarative.incremental import DeclarativeCursor
 from airbyte_cdk.sources.declarative.interpolation.interpolated_string import InterpolatedString
 from airbyte_cdk.sources.declarative.stream_slicers import CartesianProductStreamSlicer
-from airbyte_cdk.sources.declarative.types import Config, Record, StreamSlice
-from airbyte_cdk.sources.streams.http.requests_native_auth.abstract_token import AbstractHeaderAuthenticator
+from airbyte_cdk.sources.declarative.types import Config, Record, StreamSlice, StreamState
 from isodate import Duration, parse_duration
 
 
@@ -85,7 +84,7 @@ class ShortLivedTokenAuthenticator(DeclarativeAuthenticator):
 
 
 @dataclass
-class NestedStateCartesianProductStreamSlicer(CartesianProductStreamSlicer):
+class NestedStateCartesianProductStreamSlicer(DeclarativeCursor, CartesianProductStreamSlicer):
     """
     [Low-Code Custom Component] NestedStateCartesianProductStreamSlicer
     https://github.com/airbytehq/airbyte/issues/22873
@@ -114,21 +113,45 @@ class NestedStateCartesianProductStreamSlicer(CartesianProductStreamSlicer):
     def get_stream_state(self) -> Mapping[str, Any]:
         return self._cursor
 
-    def stream_slices(self, sync_mode: SyncMode, stream_state: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    def set_initial_state(self, stream_state: StreamState) -> None:
+        self._cursor = stream_state
+
+    def close_slice(self, stream_slice: StreamSlice, most_recent_record: Optional[Record]) -> None:
+        connection_id = str(stream_slice.get("connectionId", ""))
+        if connection_id and most_recent_record:
+            current_cursor_value = self._cursor.get(connection_id, {}).get("updatedAt", "")
+            new_cursor_value = most_recent_record.get("updatedAt", "")
+
+            self._cursor[connection_id] = {"updatedAt": max(current_cursor_value, new_cursor_value)}
+
+    def stream_slices(self) -> Iterable[StreamSlice]:
         connections_slicer, datetime_slicer = self.stream_slicers
-        for connection_slice in connections_slicer.stream_slices(sync_mode, stream_state):
-            businessName = connection_slice["connection"]["businessName"]
-            serviceName = connection_slice["connection"]["serviceName"]
-            datetime_slicer._cursor = None
-            for datetime_slice in datetime_slicer.stream_slices(sync_mode, stream_state.get(businessName, {}).get(serviceName, {})):
+        for connection_slice in connections_slicer.stream_slices():
+            connection_id = str(stream_slice.get("connectionId", ""))
+
+            connection_state = self._cursor.get(connection_id, {})
+
+            datetime_slicer.set_initial_state(connection_state)
+            for datetime_slice in datetime_slicer.stream_slices():
+                datetime_slice["connectionId"] = connection_id
                 yield connection_slice | datetime_slice
 
-    def update_cursor(self, stream_slice: StreamSlice, last_record: Optional[Record] = None):
-        datetime_slicer = self.stream_slicers[1]
-        datetime_slicer.update_cursor(stream_slice, last_record)
-        if last_record:
-            businessName = stream_slice["connection"]["businessName"]
-            serviceName = stream_slice["connection"]["serviceName"]
-            self._cursor.setdefault(businessName, {}).setdefault(serviceName, {}).update(datetime_slicer.get_stream_state())
+    def should_be_synced(self, record: Record) -> bool:
+        """
+        As of 2023-06-28, the expectation is that this method will only be used for semi-incremental and data feed and therefore the
+        implementation is irrelevant for railz
+        """
+        return True
+
+    def is_greater_than_or_equal(self, first: Record, second: Record) -> bool:
+        """
+        Evaluating which record is greater in terms of cursor. This is used to avoid having to capture all the records to close a slice
+        """
+        first_cursor_value = first.get("updatedAt")
+        second_cursor_value = second.get("updatedAt")
+        if first_cursor_value and second_cursor_value:
+            return first_cursor_value >= second_cursor_value
+        elif first_cursor_value:
+            return True
         else:
-            self._cursor = stream_slice
+            return False
