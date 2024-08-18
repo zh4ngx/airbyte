@@ -228,7 +228,7 @@ definitions:
           orderBy: "{{ parameters.cursor_field }}"
     incremental_sync:
       type: CustomIncrementalSync
-      class_name: source_railz.components.NestedStateCartesianProductStreamSlicer
+      class_name: CartesianProductStreamSlicer
       stream_slicers:
         - type: SubstreamPartitionRouter
           parent_stream_configs:
